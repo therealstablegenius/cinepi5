@@ -1,0 +1,2028 @@
+#!/usr/bin/env bash
+# ==============================================================================
+#  CinePi5 Ultimate Deployment Script – "Pinnacle" Edition (v4.1.0)
+#  • Raspberry Pi 5 -- single-file installer / updater / backup suite
+#  • GUI (Zenity) + CLI fall-back
+#  • Hardened system user, UFW firewall, systemd sandbox
+#  • DKMS custom kernel modules
+#  • OTA with SHA-256 verification & atomic rollback
+#  • Incremental backup chain with rotation & integrity test
+#  • Colour-coded logging, atomic file writes, full error-trapping
+#  • Python Virtual Environment for dependencies
+#  • Disk space pre-checks and warnings
+#  • Camera manual controls via Web API (ISO, Shutter, AWB)
+#  • Onboarding HTML page for first-time users
+#  • Permissions and Log directory repair utility
+# ------------------------------------------------------------------------------
+#  Author :  CineSoft Labs    <support@cinesoft.io>
+#  Licence:  MIT
+# ==============================================================================
+set -euo pipefail
+shopt -s inherit_errexit # Ensure ERR trap is inherited by functions and subshells
+
+# ───────────────────────────── 1 ▸ GLOBALS ────────────────────────────────────
+# System User & Group
+APP_USER="cinepi"
+APP_GROUP="cinepi" # Primary group for service account
+
+# Core Directories
+INSTALL_DIR="/opt/cinepi5" # Application root
+CONFIG_DIR="/etc/cinepi5"  # System-wide configuration
+LOG_DIR="/var/log/cinepi5" # System logs for the application and installer
+MEDIA_DIR="/media/cinepi"  # Mount point for external media (e.g., SSD for footage)
+BACKUP_DIR="$MEDIA_DIR/backups" # Backup storage location
+OTA_DIR="$INSTALL_DIR/ota" # Over-The-Air update staging area
+KMOD_SRC="/usr/src/cinepi5-kmods" # Kernel module build directory
+
+# GitHub Repository Details
+REPO_OWNER="YourOrg" # <--- EDIT THIS TO YOUR GITHUB ORGANIZATION/USER
+REPO_NAME="CinePi5"  # <--- EDIT THIS TO YOUR REPOSITORY NAME
+REPO_BRANCH="main"   # <--- EDIT THIS TO YOUR MAIN BRANCH
+
+# Network Ports
+SSH_PORT=22    # Standard SSH port
+HTTP_PORT=8080 # CinePi5 Web UI port
+UDP_PORT=5000  # CinePi5 Heartbeat / Telemetry UDP port
+
+# Backup Policy (Passed as environment variables to embedded backup script)
+MAX_FULL_BACKUPS=3      # Keep this many full backup chains
+RETENTION_DAYS=30       # Prune any backups (full or incremental) older than this
+SNAPSHOT_FILE="$BACKUP_DIR/cinepi5.snar" # tar-incremental state file
+
+# GitHub Token for higher API limits / private repos (optional)
+GITHUB_TOKEN_FILE="$CONFIG_DIR/github_token"
+
+# Python Package Versions (version-pinned for stability)
+# Ensure these ranges are compatible and cover your application's needs.
+PY_PKGS=(
+  "moderngl>=5.8,<6.0"
+  "moderngl-window>=2.5,<3.0"
+  "cube_lut>=0.1,<0.2"
+  "picamera2>=0.3,<0.4"
+  "flask>=2.2,<3.0"
+  "flask-sock>=0.6,<0.7"
+  "numpy>=1.23,<2.0"
+  "Pillow>=10.0,<11.0"
+  "cryptography>=41.0,<42.0"
+  "requests>=2.31,<3.0"
+)
+
+# Custom Kernel Modules (names must match dkms.conf PACKAGE_NAME)
+# Source paths are relative to $INSTALL_DIR/modules/ or full Git URLs.
+KERNEL_MODULES=(
+  "gpio_tally:$INSTALL_DIR/modules/gpio_tally" # Example: local source
+  "visionicam:https://github.com/YourOrg/visionicam.git" # Example: remote Git repo
+  "cinelens_ctl:https://github.com/YourOrg/cinelens_ctl.git" # Example: remote Git repo
+)
+
+# ───────────────────────────── 2 ▸ UTILS ──────────────────────────────────────
+# ANSI color codes for terminal output
+GREEN="\033[0;32m"
+YELLOW="\033[1;33m"
+RED="\033[0;31m"
+NC="\033[0m" # No Color
+
+# Logging functions: all output goes to console and a log file
+log() {
+  printf "%s%s%s\n" "${GREEN}[INFO]${NC} " "$1" | tee -a "${LOG_DIR}/installer.log"
+}
+warn() {
+  printf "%s%s%s\n" "${YELLOW}[WARN]${NC} " "$1" | tee -a "${LOG_DIR}/installer.log" >&2
+}
+die() {
+  printf "%s%s%s\n" "${RED}[FAIL]${NC} " "$1" | tee -a "${LOG_DIR}/installer.log" >&2
+  exit 1
+}
+
+# Check if a command exists
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "'$1' command is required but not found. Please install it."
+}
+
+# Check if GUI (Zenity) is available
+need_gui() {
+  [[ -n "${DISPLAY:-}" ]] || die "This installer requires a graphical environment (X11) to run."
+  need_cmd zenity || die "Zenity GUI tool is required but not found. Please install it (e.g., 'sudo apt install zenity')."
+}
+
+# Atomic file creation helper: writes command output to a temp file, then moves it.
+# This prevents corrupted files if the script is interrupted during writing.
+# Usage: atomic_create <target_file> <command_to_generate_content> [arg1] [arg2] ...
+atomic_create() {
+  local target_file="$1"
+  shift
+  local temp_file
+  temp_file="$(dirname "$target_file")/.tmp_$(basename "$target_file")_$$"
+
+  # Execute the command, redirecting its stdout to the temporary file
+  if ! "$@" >"$temp_file"; then
+    rm -f "$temp_file" # Clean up temp file on failure
+    die "Failed to generate content for '$target_file'"
+  fi
+
+  # Atomically move the temporary file to the target location
+  if ! mv "$temp_file" "$target_file"; then
+    rm -f "$temp_file" # Clean up temp file on failure
+    die "Failed to atomically create '$target_file'"
+  fi
+
+  # Set permissions and ownership for the newly created file
+  # This assumes the file is created by root and needs to be owned by APP_USER
+  chown "${APP_USER}:${APP_GROUP}" "$target_file" || warn "Could not set ownership for $target_file"
+  chmod 644 "$target_file" || warn "Could not set permissions for $target_file"
+  log "Created/Updated: $target_file"
+}
+
+# Checks for minimum Python version
+check_python_version() {
+  log "Checking Python version (minimum 3.9)..."
+  local version
+  version="$(python3 -c 'import sys; print(".".join(map(str, sys.version_info[:3])))')"
+  local min_version="3.9.0"
+  # Compare versions using sort -V (version sort)
+  if [ "$(printf '%s\n' "$min_version" "$version" | sort -V | head -n1)" != "$min_version" ]; then
+    die "Python 3.9+ is required. Detected: $version. Please upgrade Python before continuing."
+  fi
+  log "Python version $version is sufficient."
+}
+
+# Checks for available disk space
+check_disk_space() {
+  local path="$1"
+  local min_gb="${2:-4}" # Default minimum 4GB
+  local avail_gb
+  # df -BG: display in GB, --output=avail: show available space
+  avail_gb=$(df -BG --output=avail "$path" | tail -n1 | tr -dc '0-9') # Extract numeric part
+
+  if [ "$avail_gb" -lt "$min_gb" ]; then
+    warn "Low disk space on $path: only ${avail_gb}GB available (minimum required: ${min_gb}GB)."
+    if [[ -n "${DISPLAY:-}" ]]; then
+      zenity --warning --title="Low Disk Space" --text="Low disk space detected on $path: only ${avail_gb}GB available. This may cause backups or updates to fail." --width=450
+    fi
+    # Optionally, you could die here if disk space is critical:
+    # die "Not enough disk space on $path to proceed."
+  else
+    log "Sufficient disk space on $path: ${avail_gb}GB available (required: ${min_gb}GB)."
+  fi
+}
+
+
+# ─────────────────────────── 3 ▸ USER & DIRS ──────────────────────────────────
+# Ensures the dedicated application user and necessary directories exist with correct permissions.
+ensure_app_user() {
+  log "Ensuring system user '${APP_USER}' and core directories..."
+
+  # Create application group if it doesn't exist
+  if ! getent group "$APP_GROUP" >/dev/null; then
+    groupadd --system "$APP_GROUP" || die "Failed to create system group: ${APP_GROUP}"
+    log "Created system group: ${APP_GROUP}"
+  fi
+
+  # Create application user if it doesn't exist
+  if ! id "$APP_USER" >/dev/null 2>&1; then
+    useradd --system --create-home \
+      --gid "$APP_GROUP" \
+      --shell /usr/sbin/nologin \
+      --comment "CinePi5 Service Account" \
+      --groups video,render,gpio,spi,i2c \
+      "$APP_USER" || die "Failed to create system user: ${APP_USER}"
+    log "Created system user: ${APP_USER} and added to hardware groups."
+  else
+    log "User '${APP_USER}' already exists."
+    # Ensure user is in required hardware access groups (idempotent)
+    for group in video render gpio spi i2c; do
+      if getent group "$group" >/dev/null; then
+        if ! groups "$APP_USER" | grep -qw "$group"; then
+          usermod -aG "$group" "$APP_USER" || warn "Failed to add ${APP_USER} to group ${group}."
+          log "Added ${APP_USER} to group ${group}."
+        fi
+      else
+        warn "Required group '${group}' does not exist on this system."
+      fi
+    done
+  fi
+
+  # Ensure core directories exist and have correct ownership/permissions
+  local core_dirs=("$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" "$BACKUP_DIR" "$OTA_DIR" "$MEDIA_DIR")
+  for d in "${core_dirs[@]}"; do
+    if [ ! -d "$d" ]; then
+      mkdir -p "$d" || die "Failed to create directory: $d"
+      log "Created directory: $d"
+    fi
+    # Set ownership and permissions (idempotent)
+    chown "${APP_USER}:${APP_GROUP}" "$d" || warn "Failed to set ownership for $d"
+    chmod 750 "$d" || warn "Failed to set permissions for $d"
+  done
+  log "User and directory setup complete."
+}
+
+# ─────────────────────────── 4 ▸ DEPENDENCIES ────────────────────────────────
+# Installs necessary APT packages and Python dependencies with version pinning.
+install_deps() {
+  log "Installing system and Python dependencies..."
+
+  # Update package lists
+  log "Updating APT package lists..."
+  apt-get update -qq || die "Failed to update APT package lists."
+
+  # Install core APT packages
+  log "Installing core APT packages..."
+  export DEBIAN_FRONTEND=noninteractive # Prevent interactive prompts
+  apt-get install -y \
+    git dkms build-essential \
+    libcamera-dev libcamera-apps python3-libcamera \
+    python3-pip python3-venv \
+    libegl1 libgbm-dev libdrm-dev mesa-utils-extra \
+    jq curl ufw zenity raspberrypi-kernel-headers \
+    libssl-dev rsync || die "Failed to install core APT packages."
+
+  # Set up Python virtualenv for CinePi5
+  log "Setting up Python virtual environment for CinePi5..."
+  sudo -u "$APP_USER" python3 -m venv "$INSTALL_DIR/venv" || die "Failed to create venv at $INSTALL_DIR/venv"
+
+  # Upgrade pip, setuptools, wheel within the virtualenv
+  log "Upgrading pip, setuptools, wheel within virtual environment..."
+  sudo -u "$APP_USER" "$INSTALL_DIR/venv/bin/pip" install --upgrade pip "setuptools>=65.0" "wheel>=0.38.0" || \
+    warn "Failed to upgrade Python tooling in venv. Continuing anyway."
+
+  # Install Python packages with version pinning into the virtualenv
+  log "Installing Python packages with specified versions into virtual environment..."
+  sudo -u "$APP_USER" "$INSTALL_DIR/venv/bin/pip" install --no-cache-dir "${PY_PKGS[@]}" || \
+    die "Failed to install Python packages in venv. Check versions and network."
+
+  # Sanity import check for critical Python modules using the venv's Python
+  log "Verifying critical Python module imports using venv Python..."
+  for m_spec in "${PY_PKGS[@]}"; do
+    local module_name=$(echo "$m_spec" | sed -E 's/([a-zA-Z0-9_-]+).*/\1/')
+    sudo -u "$APP_USER" "$INSTALL_DIR/venv/bin/python" -c "import importlib; importlib.import_module('$module_name')" || \
+      die "Python failed to import critical module: '$module_name' in venv. Check installation."
+  done
+  log "All dependencies installed and verified."
+}
+
+# ─────────────────────────── 5 ▸ REPOSITORY ──────────────────────────────────
+# Clones or updates the CinePi5 application repository.
+clone_repo() {
+  log "Fetching CinePi5 application source code from GitHub..."
+
+  if [[ -d "$INSTALL_DIR/.git" ]]; then
+    log "Existing repository found. Updating to latest '${REPO_BRANCH}' branch..."
+    git -C "$INSTALL_DIR" fetch origin "$REPO_BRANCH" || die "Failed to fetch latest changes from Git."
+    git -C "$INSTALL_DIR" reset --hard "origin/$REPO_BRANCH" || die "Failed to reset repository to latest branch."
+  else
+    log "Cloning new repository into '${INSTALL_DIR}'..."
+    # Clone as APP_USER to ensure correct ownership from the start
+    sudo -u "$APP_USER" git clone -b "$REPO_BRANCH" \
+      "https://github.com/$REPO_OWNER/$REPO_NAME.git" "$INSTALL_DIR" || \
+      die "Failed to clone repository. Check URL, branch, and network."
+  fi
+  # Ensure ownership is correct after clone/update
+  chown -R "${APP_USER}:${APP_GROUP}" "$INSTALL_DIR" || warn "Failed to set ownership for ${INSTALL_DIR}"
+  log "CinePi5 repository cloned/updated successfully."
+}
+
+# ────────────────────────── 6 ▸ KERNEL MODULES ───────────────────────────────
+# Compiles and installs custom kernel modules using DKMS.
+install_kernel_modules() {
+  log "Building and installing custom kernel modules via DKMS..."
+  mkdir -p "$KMOD_SRC" || die "Failed to create kernel module source directory: $KMOD_SRC"
+
+  for module_spec in "${KERNEL_MODULES[@]}"; do
+    IFS=':' read -r mod_name mod_path <<< "$module_spec"
+    local src_dir="${KMOD_SRC}/${mod_name}" # Build directory for the module
+
+    log "Processing module: ${mod_name} (Source: ${mod_path})"
+
+    # Handle module source: clone if URL, copy if local path
+    if [[ "$mod_path" == http* ]]; then
+      log "Cloning module '${mod_name}' from Git repository..."
+      if [ -d "$src_dir/.git" ]; then
+        git -C "$src_dir" pull || die "Failed to pull updates for ${mod_name}."
+      else
+        rm -rf "$src_dir" # Clean previous attempts
+        git clone "$mod_path" "$src_dir" || die "Failed to clone ${mod_name} repository."
+      fi
+    else
+      log "Copying local module '${mod_name}' source from '${mod_path}'..."
+      if [ ! -d "$mod_path" ]; then
+        die "Local module source not found: ${mod_path}"
+      fi
+      rm -rf "$src_dir" # Clean previous attempts
+      cp -r "$mod_path" "$src_dir" || die "Failed to copy local module source for ${mod_name}."
+    fi
+
+    # Ensure source directory is owned by root for DKMS operations
+    chown -R root:root "$src_dir" || warn "Failed to set root ownership for ${src_dir}"
+
+    # Determine module version from dkms.conf
+    local module_version
+    module_version=$(grep -Po '^PACKAGE_VERSION="\K[^\"]+' "${src_dir}/dkms.conf" 2>/dev/null || echo "1.0")
+    log "Detected version for ${mod_name}: ${module_version}"
+
+    # DKMS operations
+    log "DKMS: Removing old versions of '${mod_name}'..."
+    dkms remove -m "$mod_name" -v "$module_version" -k "$(uname -r)" --quiet || true # Safe to ignore errors here
+
+    log "DKMS: Adding '${mod_name}' to DKMS tree..."
+    dkms add -m "$mod_name" -v "$module_version" -k "$(uname -r)" || die "DKMS add failed for ${mod_name}."
+
+    log "DKMS: Building '${mod_name}'..."
+    dkms build -m "$mod_name" -v "$module_version" -k "$(uname -r)" || die "DKMS build failed for ${mod_name}. Check kernel headers."
+
+    log "DKMS: Installing '${mod_name}'..."
+    dkms install -m "$mod_name" -v "$module_version" -k "$(uname -r)" || die "DKMS install failed for ${mod_name}."
+
+    # Load module and verify
+    log "Loading kernel module: ${mod_name}..."
+    depmod -a || warn "Failed to update kernel module dependencies (depmod)."
+    modprobe "$mod_name" || die "Kernel module '${mod_name}' failed to load. Check 'dmesg' for errors."
+
+    # Ensure module loads on boot
+    log "Ensuring '${mod_name}' loads on boot..."
+    echo "$mod_name" | tee -a /etc/modules-load.d/cinepi5.conf >/dev/null || warn "Failed to add ${mod_name} to modules-load.d."
+  done
+  log "All custom kernel modules installed and loaded successfully."
+}
+
+# ────────────────────────── 7 ▸ FIREWALL ───────────────────────────────────
+# Configures the UFW firewall with secure defaults and specific rules for CinePi5.
+setup_firewall() {
+  log "Configuring UFW firewall with secure defaults..."
+
+  # Reset firewall to a clean state
+  ufw --force reset || die "Failed to reset UFW firewall."
+
+  # Set default policies (deny incoming, allow outgoing)
+  ufw default deny incoming || die "Failed to set default incoming policy."
+  ufw default allow outgoing || die "Failed to set default outgoing policy."
+
+  # Allow specific ports for CinePi5 services
+  ufw allow "$SSH_PORT"/tcp comment 'SSH Access' || warn "Failed to allow SSH port."
+  ufw allow "$HTTP_PORT"/tcp comment 'CinePi5 Web UI' || warn "Failed to allow HTTP port."
+  ufw allow "$UDP_PORT"/udp comment 'CinePi5 Heartbeat/Telemetry' || warn "Failed to allow UDP port."
+
+  # Enable the firewall
+  ufw --force enable || die "Failed to enable UFW firewall."
+
+  log "UFW configured successfully. Current status:"
+  ufw status verbose | tee -a "${LOG_DIR}/installer.log" # Log verbose status
+}
+
+# ────────────────────────── 8 ▸ SYSTEMD SERVICE ──────────────────────────────
+# Installs and configures the main CinePi5 systemd service with sandboxing.
+setup_service() {
+  log "Installing and hardening CinePi5 systemd service..."
+
+  # Use atomic_create for the service file
+  atomic_create /etc/systemd/system/cinepi5.service cat <<EOF
+[Unit]
+Description=CinePi5 Camera System
+After=network-online.target multi-user.target
+
+[Service]
+User=${APP_USER}
+Group=${APP_GROUP}
+WorkingDirectory=${INSTALL_DIR}
+ExecStart=${INSTALL_DIR}/venv/bin/python ${INSTALL_DIR}/cinepi5_gpu.py # Use Python from virtualenv
+Restart=always
+RestartSec=3
+Nice=-10
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=50
+
+# Security Hardening (Sandboxing)
+PrivateTmp=yes             # Mounts a private /tmp and /var/tmp for the service
+ProtectSystem=strict       # Makes /usr, /boot, /etc read-only
+ProtectHome=read-only      # Makes /home, /root read-only
+NoNewPrivileges=yes        # Prevents gaining new privileges
+CapabilityBoundingSet=CAP_SYS_NICE CAP_SYS_RAWIO # Limits capabilities
+ReadWritePaths=${INSTALL_DIR} ${MEDIA_DIR} ${LOG_DIR} # Explicitly allow write access to these paths
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload || die "Failed to reload systemd daemon."
+  systemctl enable cinepi5 || die "Failed to enable cinepi5 service."
+  log "CinePi5 systemd service installed and enabled."
+}
+
+# ────────────────────────── 9 ▸ BACKUP (Pinnacle v3.5-style) ─────────────────
+# Deploys the professional-grade incremental backup system.
+setup_backup() {
+  log "Deploying CinePi5 professional backup system..."
+
+  # Embedded backup script (v3.5.0 logic)
+  # This script is self-contained and uses environment variables passed from the main installer
+  atomic_create /usr/local/bin/cinepi5-backup cat <<'BACKUP_EOF'
+#!/usr/bin/env bash
+# CinePi5 Professional Backup System v3.7.0 (Embedded)
+# The Epitome of Backup Perfection
+
+# ─── Configuration ──────────────────────────────────────────────────
+set -Eeuo pipefail
+
+# System Constants (sourced from deployer or environment)
+: "${BACKUP_ROOT:=/media/cinepi}"
+: "${BACKUP_DIR:=${BACKUP_ROOT}/backups}"
+: "${LOG_DIR:=/var/log/cinepi5}" # Primary log for runtime
+: "${SNAPSHOT_FILE:=${BACKUP_DIR}/cinepi5.snar}"
+: "${MAX_FULL_BACKUPS:=3}"
+: "${RETENTION_DAYS:=14}"
+: "${APP_USER:=cinepi}"
+: "${APP_GROUP:=cinepi}"
+
+# Critical paths to backup (absolute paths required)
+readonly BACKUP_PATHS=(
+    "/opt/cinepi5"
+    "/etc/cinepi5"
+    "/etc/modules-load.d/cinepi5.conf"
+    "/etc/systemd/system/cinepi5*"
+    "/usr/local/bin/cinepi5-*"
+)
+
+# Exclude patterns (prevent backup recursion and temporary files)
+readonly EXCLUDE_PATTERNS=(
+    "--exclude=${BACKUP_ROOT}"
+    "--exclude=/opt/cinepi5/ota/*.tgz"
+    "--exclude=/opt/cinepi5/ota/*.log"
+    "--exclude=*.tmp"
+    "--exclude=*.temp"
+    "--exclude=*~"
+)
+
+# ─── Logging System ────────────────────────────────────────────────
+# Note: init_logging is handled by the main installer. This script assumes dirs exist.
+log() {
+    local timestamp severity msg log_entry
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    severity="${1}"
+    msg="${2}"
+    log_entry="[${timestamp}] [${severity}] ${msg}"
+
+    # Primary log (direct append)
+    echo "${log_entry}" >> "${LOG_DIR}/backup.log" || {
+        # Fallback log (with tee to ensure write)
+        echo "${log_entry}" | tee -a "${BACKUP_DIR}/backup_fallback.log" >/dev/null || true
+    }
+
+    # Always show errors on stderr
+    [ "${severity}" = "ERROR" ] && echo "${log_entry}" >&2
+}
+
+# ─── Atomic File Operations ───────────────────────────────────────
+atomic_create() {
+    local src="${1}" dest="${2}"
+
+    if ! mv -f "${src}" "${dest}"; then
+        log "ERROR" "Atomic create failed: ${dest}"
+        rm -f "${src}"
+        return 1
+    fi
+    # Set ownership for the newly created file (assumes root context or sufficient permissions)
+    chown "${APP_USER}:${APP_GROUP}" "${dest}" || log "WARNING" "Could not set ownership for ${dest}"
+    return 0
+}
+
+# ─── Backup Creation ──────────────────────────────────────────────
+create_backup() {
+    local backup_type="${1}"
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    local backup_file="${BACKUP_DIR}/cinepi5_${backup_type}_${timestamp}.tgz"
+    local temp_file="${backup_file}.tmp"
+    local snar_temp="${SNAPSHOT_FILE}.tmp"
+
+    log "INFO" "Initiating ${backup_type} backup process"
+
+    # Full backup preparation: preserve current snar state, then create fresh
+    if [ "${backup_type}" = "full" ]; then
+        if [ -f "${SNAPSHOT_FILE}" ] && ! cp -p "${SNAPSHOT_FILE}" "${SNAPSHOT_FILE}.bak"; then
+            log "ERROR" "Failed to preserve snapshot file. Aborting full backup."
+            return 1
+        fi
+        : > "${snar_temp}" # Initialize fresh snar file
+    # Incremental backup preparation: copy existing snar
+    elif [ ! -f "${SNAPSHOT_FILE}" ]; then
+        log "ERROR" "Missing snapshot file for incremental backup. Cannot proceed."
+        return 1
+    elif ! cp -p "${SNAPSHOT_FILE}" "${snar_temp}"; then
+        log "ERROR" "Failed to prepare incremental snapshot. Aborting."
+        return 1
+    fi
+
+    # Execute backup with explicit tar --create
+    if ! tar --create \
+            --file="${temp_file}" \
+            --listed-incremental="${snar_temp}" \
+            --directory=/ \
+            "${EXCLUDE_PATTERNS[@]}" \
+            "${BACKUP_PATHS[@]}"; then
+        log "ERROR" "Tar backup creation command failed. Removing temporary files."
+        rm -f "${temp_file}" "${snar_temp}"
+        # Restore old snar file if full backup failed after snapshot preservation
+        [ "${backup_type}" = "full" ] && [ -f "${SNAPSHOT_FILE}.bak" ] && mv -f "${SNAPSHOT_FILE}.bak" "${SNAPSHOT_FILE}"
+        return 1
+    fi
+
+    # Verify backup integrity (test if tar archive is readable)
+    if ! tar --test --file="${temp_file}" >/dev/null 2>&1; then
+        log "ERROR" "Backup integrity verification failed. Removing temporary files."
+        rm -f "${temp_file}" "${snar_temp}"
+        # Restore old snar file if full backup failed after snapshot preservation
+        [ "${backup_type}" = "full" ] && [ -f "${SNAPSHOT_FILE}.bak" ] && mv -f "${SNAPSHOT_FILE}.bak" "${SNAPSHOT_FILE}"
+        return 1
+    fi
+
+    # Finalize files atomically
+    atomic_create "${temp_file}" "${backup_file}" || { log "ERROR" "Failed to finalize backup file."; return 1; }
+    atomic_create "${snar_temp}" "${SNAPSHOT_FILE}" || {
+        log "ERROR" "Backup created but snapshot file update failed. Future incrementals may be compromised."
+        return 1 # This is a critical error for the chain, even if backup file is good
+    }
+
+    # Create and verify checksum
+    local checksum_ok=false
+    if (cd "${BACKUP_DIR}" && \
+        sha256sum "$(basename "${backup_file}")" > "${backup_file}.sha256" && \
+        sha256sum --quiet -c "${backup_file}.sha256"); then
+        checksum_ok=true
+    fi
+
+    if ! ${checksum_ok}; then
+        log "WARNING" "Checksum verification failed for ${backup_type} backup: $(basename "${backup_file}")"
+        if [ "${backup_type}" = "full" ]; then
+            log "ERROR" "Invalid checksum on full backup. Removing to prevent corrupted chain."
+            rm -f "${backup_file}" "${backup_file}.sha256"
+            # Attempt to restore old snar if it was preserved
+            [ -f "${SNAPSHOT_FILE}.bak" ] && mv -f "${SNAPSHOT_FILE}.bak" "${SNAPSHOT_FILE}"
+            return 1 # Fatal error for full backup
+        fi
+        # For incrementals, we tolerate checksum warning but log it
+    fi
+
+    # Archive old snar file for full backups (after successful creation and verification)
+    if [ "${backup_type}" = "full" ] && [ -f "${SNAPSHOT_FILE}.bak" ]; then
+        local old_snar_archive="${SNAPSHOT_FILE}.full_${timestamp}"
+        mv -f "${SNAPSHOT_FILE}.bak" "${old_snar_archive}" || \
+            log "WARNING" "Failed to archive old snapshot file: ${SNAPSHOT_FILE}.bak"
+    fi
+
+    log "SUCCESS" "${backup_type} backup created: $(basename "${backup_file}")"
+    return 0
+}
+
+# ─── Backup Rotation ─────────────────────────────────────────────
+rotate_backups() {
+    log "INFO" "Commencing backup rotation cycle..."
+
+    # Phase 1: Remove corrupted backups (cannot be restored)
+    local corrupted_count=0
+    while IFS= read -r -d '' backup; do
+        if ! tar --test --file="${backup}" >/dev/null 2>&1; then
+            log "WARNING" "Removing corrupted backup: $(basename "${backup}")"
+            rm -f "${backup}" "${backup}.sha256"
+            ((corrupted_count++))
+        fi
+    done < <(find "${BACKUP_DIR}" -name "cinepi5_*.tgz" -type f -print0)
+    [ ${corrupted_count} -gt 0 ] && log "INFO" "Removed ${corrupted_count} corrupted backup(s)."
+
+    # Phase 2: Rotate full backup chains (based on MAX_FULL_BACKUPS)
+    local full_backups=()
+    while IFS= read -r -d '' backup; do
+        full_backups+=("${backup}")
+    done < <(find "${BACKUP_DIR}" -name "cinepi5_full_*.tgz" -type f -print0 | sort -z)
+
+    local full_count=${#full_backups[@]}
+    if [ ${full_count} -gt ${MAX_FULL_BACKUPS} ]; then
+        local to_remove=$((full_count - MAX_FULL_BACKUPS))
+        log "INFO" "Rotating out ${to_remove} oldest full backup chain(s)..."
+
+        for ((i=0; i<to_remove; i++)); do
+            local backup_to_remove="${full_backups[$i]}"
+            local timestamp=$(basename "${backup_to_remove}" | grep -oE '[0-9]{8}_[0-9]{6}')
+
+            log "INFO" "Removing full backup chain rooted at: $(basename "${backup_to_remove}")"
+            rm -f "${backup_to_remove}" "${backup_to_remove}.sha256" # Remove full backup and its checksum
+
+            # Remove associated incremental backups (newer than the full backup being removed)
+            find "${BACKUP_DIR}" -name "cinepi5_incr_*.tgz" -newer "${backup_to_remove}" -delete
+            # Remove the archived snapshot file associated with this full backup
+            rm -f "${SNAPSHOT_FILE}.full_${timestamp}"
+        done
+    fi
+
+    # Phase 3: Remove expired backups (based on RETENTION_DAYS)
+    local expired_count=0
+    while IFS= read -r -d '' backup; do
+        log "INFO" "Removing expired backup: $(basename "${backup}")"
+        rm -f "${backup}" "${backup}.sha256"
+        ((expired_count++))
+    done < <(find "${BACKUP_DIR}" -name "cinepi5_*.tgz" -type f -mtime +${RETENTION_DAYS} -print0)
+    [ ${expired_count} -gt 0 ] && log "INFO" "Removed ${expired_count} expired backup(s)."
+
+    # Phase 4: Cleanup orphaned resources (snar files, checksums)
+    local orphaned_count=0
+    # Find and remove orphaned archived snapshot files
+    while IFS= read -r -d '' snar_archive; do
+        local timestamp=$(basename "${snar_archive}" | grep -oE '[0-9]{8}_[0-9]{6}')
+        # Check if the corresponding full backup still exists
+        if [ ! -f "${BACKUP_DIR}/cinepi5_full_${timestamp}.tgz" ]; then
+            log "INFO" "Removing orphaned snapshot archive: $(basename "${snar_archive}")"
+            rm -f "${snar_archive}"
+            ((orphaned_count++))
+        fi
+    done < <(find "${BACKUP_DIR}" -name "cinepi5.snar.full_*" -type f -print0)
+
+    # Find and remove orphaned checksum files
+    while IFS= read -r -d '' checksum_file; do
+        # Check if the corresponding backup archive still exists
+        if [ ! -f "${checksum_file%.sha256}" ]; then
+            log "INFO" "Removing orphaned checksum file: $(basename "${checksum_file}")"
+            rm -f "${checksum_file}"
+            ((orphaned_count++))
+        fi
+    done < <(find "${BACKUP_DIR}" -name "*.sha256" -type f -print0)
+    [ ${orphaned_count} -gt 0 ] && log "INFO" "Removed ${orphaned_count} orphaned resource(s)."
+
+    log "INFO" "Backup rotation cycle completed."
+}
+
+# ─── Main Execution ──────────────────────────────────────────────
+main() {
+    # Initialize logging for the embedded script
+    # Note: Parent installer handles initial directory creation and ownership
+    # This ensures logs from the backup script go to the correct place
+    local backup_log_file="${LOG_DIR}/backup.log"
+    mkdir -p "$(dirname "${backup_log_file}")" # Ensure log directory exists
+    touch "${backup_log_file}" # Create log file if it doesn't exist
+    chown "${APP_USER}:${APP_GROUP}" "${backup_log_file}" # Ensure correct ownership
+
+    log "INFO" "=== CinePi5 Backup Procedure v3.7.0 ==="
+
+    # Cleanup old backups first
+    rotate_backups
+
+    # Determine backup type
+    local last_full_info=$(find "${BACKUP_DIR}" -name "cinepi5_full_*.tgz" -type f \
+        -exec test -f "${SNAPSHOT_FILE}.full_{}" \; -printf "%T@ %p\n" | \
+        sort -nr | head -1)
+    
+    local last_full_timestamp=""
+    local last_full_path=""
+    if [ -n "${last_full_info}" ]; then
+        last_full_timestamp=$(echo "${last_full_info}" | cut -d' ' -f1)
+        last_full_path=$(echo "${last_full_info}" | cut -d' ' -f2-)
+    fi
+
+    local backup_type="full"
+    if [ -n "${last_full_path}" ]; then
+        local last_full_age=$(( $(date +%s) - ${last_full_timestamp} ))
+        local full_backup_interval=$(( (RETENTION_DAYS * 86400) / MAX_FULL_BACKUPS ))
+        if [ ${last_full_age} -lt ${full_backup_interval} ]; then
+            backup_type="incr"
+        fi
+    fi
+
+    log "INFO" "Selected backup type: ${backup_type}"
+
+    # Execute backup
+    if ! create_backup "${backup_type}"; then
+        if [ "${backup_type}" = "incr" ]; then
+            log "WARNING" "Incremental backup failed. Attempting full backup as fallback."
+            create_backup "full" || {
+                log "ERROR" "Critical backup failure: Both incremental and fallback full backup failed."
+                exit 1
+            }
+        else
+            log "ERROR" "Critical backup failure: Full backup failed."
+            exit 1
+        }
+    fi
+
+    log "SUCCESS" "Backup procedure completed flawlessly."
+    exit 0
+}
+
+# ─── Error Handling ───────────────────────────────────────────────
+# Traps for graceful script termination and logging
+trap 'log "ERROR" "Script terminated abnormally (exit code: $?)"; exit 1' ERR
+trap 'log "INFO" "Script interrupted by user (SIGINT/SIGTERM)"; exit 1' INT TERM
+
+# Execute main routine
+main "$@"
+BACKUP_EOF
+  chmod +x /usr/local/bin/cinepi5-backup || die "Failed to set executable permissions for backup script."
+  log "CinePi5 backup script installed to /usr/local/bin/cinepi5-backup"
+
+  # Setup systemd timer for daily backups
+  atomic_create /etc/systemd/system/cinepi5-backup.timer cat <<EOF
+[Unit]
+Description=Daily CinePi5 Backup
+
+[Timer]
+OnCalendar=*-*-* 03:00:00 # Run daily at 3 AM
+RandomizedDelaySec=30m   # Add a random delay up to 30 minutes
+Persistent=true          # Timer will activate even if system was off at scheduled time
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  atomic_create /etc/systemd/system/cinepi5-backup.service cat <<EOF
+[Unit]
+Description=CinePi5 Backup Service Execution
+
+[Service]
+Type=oneshot
+User=${APP_USER}
+Group=${APP_GROUP}
+ExecStart=/usr/local/bin/cinepi5-backup
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload || die "Failed to reload systemd daemon after backup setup."
+  systemctl enable --now cinepi5-backup.timer || warn "Failed to enable/start backup timer. Check manually."
+  log "Daily backup timer (cinepi5-backup.timer) configured and enabled."
+}
+
+# ────────────────────────── 10 ▸ OTA UPDATE ─────────────────────────────────
+# Deploys the Over-The-Air (OTA) update system.
+setup_ota() {
+  log "Deploying OTA update system..."
+  mkdir -p "$OTA_DIR" || die "Failed to create OTA directory."
+  chown "${APP_USER}:${APP_GROUP}" "$OTA_DIR" || warn "Failed to set ownership for OTA directory."
+
+  # Python checker script (downloads update package and checksum)
+  atomic_create "$OTA_DIR/update.py" cat <<EOF
+#!/usr/bin/env python3
+import os, sys, json, requests, hashlib, shutil, tarfile
+from pathlib import Path
+
+# Environment variables passed from the calling Bash script
+OWNER = os.environ.get('REPO_OWNER')
+REPO = os.environ.get('REPO_NAME')
+INSTALL_DIR = Path(os.environ.get('INSTALL_DIR'))
+OTA_DIR = INSTALL_DIR / 'ota'
+TOKEN_FILE = Path(os.environ.get('GITHUB_TOKEN_FILE'))
+
+# Ensure OTA directory exists (redundant but safe)
+OTA_DIR.mkdir(parents=True, exist_ok=True)
+
+# Prepare headers for GitHub API requests (with optional token)
+HEADERS = {}
+if TOKEN_FILE.exists() and TOKEN_FILE.stat().st_size > 0:
+    try:
+        HEADERS['Authorization'] = f'token {TOKEN_FILE.read_text().strip()}'
+    except Exception as e:
+        print(f"WARNING: Could not read GitHub token file: {e}", file=sys.stderr)
+
+def download_asset(url, name):
+    """Downloads an asset to the OTA directory."""
+    asset_path = OTA_DIR / name
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=60)
+        response.raise_for_status() # Raise an exception for HTTP errors
+        asset_path.write_bytes(response.content)
+        return asset_path
+    except requests.exceptions.RequestException as e:
+        print(f"ERROR: Failed to download {name} from {url}: {e}", file=sys.stderr)
+        return None
+
+def main():
+    print("INFO: Starting OTA update check...")
+    try:
+        # Fetch latest release info
+        release_api_url = f"https://api.github.com/repos/{OWNER}/{REPO}/releases/latest"
+        response = requests.get(release_api_url, headers=HEADERS, timeout=30)
+        response.raise_for_status()
+        release_data = response.json()
+        release_tag = release_data.get('tag_name', 'unknown')
+        assets = {a['name']: a['browser_download_url'] for a in release_data.get('assets', [])}
+
+        # Define expected asset names
+        pkg_name = "cinepi5_pkg.tar.gz"
+        checksum_name = "checksums.sha256"
+        post_update_script_name = "post_update.sh"
+
+        # Check if required assets exist in the release
+        if pkg_name not in assets or checksum_name not in assets:
+            print("INFO: Required update assets (package or checksum) not found in latest release. Exiting.")
+            sys.exit(0)
+
+        # Download update package and checksum
+        pkg_path = download_asset(assets[pkg_name], pkg_name)
+        checksum_path = download_asset(assets[checksum_name], checksum_name)
+
+        if not pkg_path or not checksum_path:
+            print("ERROR: Failed to download required update assets. Aborting.", file=sys.stderr)
+            sys.exit(1)
+
+        # Download optional post-update script
+        post_script_path = None
+        if post_update_script_name in assets:
+            post_script_path = download_asset(assets[post_update_script_name], post_update_script_name)
+            if post_script_path:
+                post_script_path.chmod(0o755) # Make executable
+            else:
+                print("WARNING: Failed to download post-update script. Update might be incomplete.", file=sys.stderr)
+
+        # Verify SHA256 checksum
+        print("INFO: Verifying downloaded package checksum...")
+        try:
+            pkg_sha = hashlib.sha256(pkg_path.read_bytes()).hexdigest()
+            expected_sha_content = checksum_path.read_text().strip()
+            if pkg_sha not in expected_sha_content: # Use 'in' as checksum file might contain filename
+                print(f"ERROR: SHA-256 mismatch for {pkg_name}. Aborting.", file=sys.stderr)
+                sys.exit(1)
+            print("INFO: Checksum verified successfully.")
+        except Exception as e:
+            print(f"ERROR: Checksum verification failed: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        # Mark update as ready for application by the Bash script
+        (OTA_DIR / "update_ready").touch()
+        print(f"SUCCESS: Update to {release_tag} downloaded and ready for installation.")
+        sys.exit(0)
+
+    except requests.exceptions.RequestException as e:
+        print(f"ERROR: Network or GitHub API error during update check: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"ERROR: An unexpected error occurred during update check: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+EOF
+  chmod +x "$OTA_DIR/update.py" || die "Failed to make update.py executable."
+  chown "${APP_USER}:${APP_GROUP}" "$OTA_DIR/update.py" || warn "Failed to set ownership for update.py."
+  log "OTA Python checker script deployed."
+
+  # Bash applier script (performs the actual update and rollback)
+  atomic_create /usr/local/bin/cinepi5-update cat <<'EOF'
+#!/usr/bin/env bash
+# CinePi5 OTA Update Applier with Atomic Rollback
+set -euo pipefail
+
+# Environment variables (passed from main installer or assumed defaults)
+: "${INSTALL_DIR:=/opt/cinepi5}"
+: "${OTA_DIR:=${INSTALL_DIR}/ota}"
+: "${APP_USER:=cinepi}"
+: "${APP_GROUP:=cinepi}"
+
+# Define paths for update assets
+UPDATE_PACKAGE="${OTA_DIR}/cinepi5_pkg.tar.gz"
+CHECKSUM_FILE="${OTA_DIR}/checksums.sha256"
+POST_UPDATE_SCRIPT="${OTA_DIR}/post_update.sh"
+UPDATE_READY_FLAG="${OTA_DIR}/update_ready"
+
+# Log function for this script
+log_update() {
+  local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+  echo "[${timestamp}] [UPDATE] $1" | tee -a "${INSTALL_DIR}/ota/update.log" >&2
+}
+
+log_update "Starting CinePi5 update application..."
+
+# Check if an update is ready
+if [ ! -f "${UPDATE_READY_FLAG}" ]; then
+  log_update "No update pending. Exiting."
+  exit 0
+fi
+
+# Ensure update package exists
+if [ ! -f "${UPDATE_PACKAGE}" ]; then
+  log_update "Error: Update ready flag found, but package '${UPDATE_PACKAGE}' is missing. Aborting."
+  exit 1
+fi
+
+# Create a rollback snapshot before applying update
+log_update "Creating rollback snapshot..."
+ROLLBACK_DIR="/var/backups/cinepi5_rollback"
+mkdir -p "${ROLLBACK_DIR}" || { log_update "Error: Failed to create rollback directory."; exit 1; }
+ROLLBACK_ARCHIVE="${ROLLBACK_DIR}/rollback_$(date +%Y%m%d_%H%M%S).tar.gz"
+
+# Critical paths to backup for rollback
+ROLLBACK_PATHS=(
+  "${INSTALL_DIR}"
+  "/etc/cinepi5"
+  "/etc/systemd/system/cinepi5.service"
+  "/usr/local/bin/cinepi5-backup"
+  "/usr/local/bin/cinepi5-update"
+  "/etc/systemd/system/cinepi5-backup.timer"
+  "/etc/systemd/system/cinepi5-backup.service"
+  "/etc/systemd/system/cinepi5-ota.timer"
+  "/etc/systemd/system/cinepi5-ota.service"
+  "/etc/logrotate.d/cinepi5"
+  "/etc/modules-load.d/cinepi5.conf"
+)
+
+# Create the rollback archive
+if ! tar -czf "${ROLLBACK_ARCHIVE}" -C / "${ROLLBACK_PATHS[@]}"; then
+  log_update "Error: Failed to create rollback archive. Aborting update."
+  rm -f "${ROLLBACK_ARCHIVE}"
+  exit 1
+fi
+log_update "Rollback snapshot created: ${ROLLBACK_ARCHIVE}"
+
+# Set trap for rollback on error
+trap 'log_update "Update failed! Initiating rollback from ${ROLLBACK_ARCHIVE}..."; \
+      if [ -f "${ROLLBACK_ARCHIVE}" ]; then \
+        tar -xzf "${ROLLBACK_ARCHIVE}" -C / || log_update "CRITICAL: Rollback extraction failed!"; \
+      else \
+        log_update "CRITICAL: Rollback archive not found!"; \
+      fi; \
+      systemctl daemon-reload; systemctl restart cinepi5 || log_update "WARNING: Failed to restart cinepi5 after rollback."; \
+      rm -f "${UPDATE_PACKAGE}" "${CHECKSUM_FILE}" "${POST_UPDATE_SCRIPT}" "${UPDATE_READY_FLAG}" "${ROLLBACK_ARCHIVE}"; \
+      exit 1' ERR
+
+# Verify checksum of the downloaded package
+log_update "Verifying checksum of update package..."
+if ! (cd "${OTA_DIR}" && sha256sum --quiet -c "${CHECKSUM_FILE}"); then
+  log_update "Error: Checksum verification failed for update package. Aborting."
+  exit 1 # This will trigger the ERR trap
+fi
+log_update "Checksum verified successfully."
+
+# Stop CinePi5 service before applying update
+log_update "Stopping CinePi5 service..."
+systemctl stop cinepi5 || log_update "Warning: CinePi5 service not running or failed to stop."
+
+# Apply the update (aggressive: remove old install dir, then extract new)
+log_update "Applying update package..."
+rm -rf "${INSTALL_DIR}" || log_update "Warning: Failed to remove old install directory."
+mkdir -p "$(dirname "${INSTALL_DIR}")" || die "Failed to create parent directory for install."
+if ! tar -xzf "${UPDATE_PACKAGE}" -C "$(dirname "${INSTALL_DIR}")"; then
+  log_update "Error: Failed to extract update package. Aborting."
+  exit 1 # This will trigger the ERR trap
+fi
+chown -R "${APP_USER}:${APP_GROUP}" "${INSTALL_DIR}" || warn "Failed to set ownership for ${INSTALL_DIR} after update."
+
+# Run post-update script if it exists and is executable
+if [ -x "${POST_UPDATE_SCRIPT}" ]; then
+  log_update "Executing post-update script..."
+  "${POST_UPDATE_SCRIPT}" || log_update "Warning: Post-update script failed. Continuing."
+fi
+
+# Reload systemd daemon and restart CinePi5 service
+log_update "Reloading systemd daemon and restarting CinePi5 service..."
+systemctl daemon-reload || log_update "Warning: Failed to reload systemd daemon."
+systemctl start cinepi5 || log_update "Warning: Failed to start cinepi5 service after update."
+
+# Clean up update artifacts and rollback archive on success
+log_update "Cleaning up update artifacts and rollback archive..."
+rm -f "${UPDATE_PACKAGE}" "${CHECKSUM_FILE}" "${POST_UPDATE_SCRIPT}" "${UPDATE_READY_FLAG}" "${ROLLBACK_ARCHIVE}" || \
+  log_update "Warning: Failed to clean up all update artifacts."
+
+log_update "CinePi5 update applied successfully."
+exit 0
+EOF
+  chmod +x /usr/local/bin/cinepi5-update || die "Failed to make cinepi5-update executable."
+  chown "${APP_USER}:${APP_GROUP}" /usr/local/bin/cinepi5-update || warn "Failed to set ownership for cinepi5-update."
+  log "OTA Bash applier script deployed."
+
+  # Systemd timer for daily OTA checks
+  atomic_create /etc/systemd/system/cinepi5-ota.service cat <<EOF
+[Unit]
+Description=CinePi5 OTA Checker
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=${APP_USER}
+Environment=REPO_OWNER=${REPO_OWNER} REPO_NAME=${REPO_NAME} INSTALL_DIR=${INSTALL_DIR} GITHUB_TOKEN_FILE=${GITHUB_TOKEN_FILE}
+ExecStart=/usr/bin/python3 ${OTA_DIR}/update.py
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  atomic_create /etc/systemd/system/cinepi5-ota.timer cat <<EOF
+[Unit]
+Description=Daily CinePi5 OTA check
+
+[Timer]
+OnCalendar=*-*-* 03:00:00 # Run daily at 3 AM
+RandomizedDelaySec=1h    # Add a random delay up to 1 hour
+Persistent=true          # Timer will activate even if system was off at scheduled time
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload || die "Failed to reload systemd daemon after OTA setup."
+  systemctl enable --now cinepi5-ota.timer || warn "Failed to enable/start OTA timer. Check manually."
+  log "Daily OTA update timer (cinepi5-ota.timer) configured and enabled."
+}
+
+# ────────────────────────── 11 ▸ LOGROTATE ───────────────────────────────────
+# Configures log rotation for CinePi5 logs.
+setup_logrotate() {
+  log "Configuring log rotation for CinePi5 logs..."
+
+  atomic_create /etc/logrotate.d/cinepi5 cat <<EOF
+${LOG_DIR}/*.log {
+  weekly
+  rotate 4
+  compress
+  delaycompress
+  missingok
+  notifempty
+  create 0640 ${APP_USER} ${APP_GROUP}
+  postrotate
+    # Signal CinePi5 service to re-open its log files
+    systemctl kill -s HUP cinepi5.service >/dev/null 2>&1 || true
+  endscript
+}
+EOF
+  log "Logrotate rules for CinePi5 added."
+}
+
+# ────────────────────────── 12 ▸ GUI MENU ────────────────────────────────────
+# Main menu and restore dialog for Zenity GUI.
+main_menu() {
+  while true; do
+    choice=$(zenity --list --title="CinePi5 Installer & Utility" --width=450 --height=380 --hide-header \
+      --column="ID" --column="Action" \
+      1 "Install / Upgrade CinePi5" \
+      2 "Run Backup Now" \
+      3 "Restore System from Backup" \
+      4 "Manage Kernel Modules" \
+      5 "Adjust Camera Controls" \
+      6 "Repair Permissions & Logs" \
+      7 "Exit") || exit 0 # Exit if user cancels main menu
+
+    case "$choice" in
+      1) run_full_installation ;;
+      2) run_backup_now ;;
+      3) run_restore_dialog ;;
+      4) manage_kernel_modules_gui ;;
+      5) manual_controls_menu ;; # New menu option
+      6) repair_perms_logs ;;    # New menu option
+      7|*) exit 0 ;; # Exit on 'Exit' or any other choice/cancel
+    esac
+  done
+}
+
+# Wrapper for running backup from GUI
+run_backup_now() {
+  log "User requested manual backup."
+  if sudo -u "${APP_USER}" /usr/local/bin/cinepi5-backup; then
+    zenity --info --title="Backup Complete" --text="Backup process finished successfully." --width=300
+  else
+    zenity --error --title="Backup Failed" --text="Backup process failed. Check logs in ${LOG_DIR}/backup.log" --width=400
+  fi
+}
+
+# Wrapper for restore from GUI
+run_restore_dialog() {
+  log "User requested restore operation."
+  local available_backups=()
+  # Populate list of available backups for selection
+  while IFS= read -r -d '' f; do
+    available_backups+=("$(basename "$f")" "$f")
+  done < <(find "${BACKUP_DIR}" -name "cinepi5_*.tgz" -type f -print0 | sort -rz) # Sort by date descending
+
+  if [ ${#available_backups[@]} -eq 0 ]; then
+    zenity --info --title="No Backups Found" --text="No backup files found in ${BACKUP_DIR}." --width=300
+    return 0
+  fi
+
+  local selected_file=$(zenity --list --title="Select Backup to Restore" \
+    --text="Choose a backup file to restore from. This will overwrite current system files." \
+    --width=600 --height=400 --column="Backup File" --column="Full Path" \
+    "${available_backups[@]}" --hide-column=2 --print-column=2)
+
+  if [ -z "$selected_file" ]; then
+    log "Restore cancelled by user."
+    return 0
+  fi
+
+  if ! zenity --question --title="Confirm Restore" \
+    --text="WARNING: Restoring from '${selected_file}' will overwrite system files.\n\nAre you absolutely sure you want to proceed?" \
+    --width=450; then
+    log "Restore cancelled by user confirmation."
+    return 0
+  fi
+
+  # Call the restore function (defined below)
+  if restore_system_from_backup "$selected_file"; then
+    zenity --info --title="Restore Complete" --text="System restored successfully from:\n${selected_file}\n\nReboot recommended." --width=400
+  else
+    zenity --error --title="Restore Failed" --text="System restore failed. Check logs in ${LOG_DIR}/installer.log" --width=450
+  fi
+}
+
+# This function performs the actual system restore.
+# It is designed to be robust but simplified for a single-file installer.
+# For a full incremental chain restore, a more complex dedicated script would be needed.
+restore_system_from_backup() {
+  local backup_file="$1"
+  log "INFO" "Attempting to restore system from: ${backup_file}"
+
+  if [ ! -f "${backup_file}" ]; then
+    log "ERROR" "Backup file not found: ${backup_file}"
+    return 1
+  fi
+
+  # Verify checksum before restoring (if .sha256 exists)
+  if [ -f "${backup_file}.sha256" ]; then
+    log "INFO" "Verifying checksum for ${backup_file}..."
+    if ! sha256sum --quiet -c "${backup_file}.sha256"; then
+      log "ERROR" "Checksum mismatch for ${backup_file}. Aborting restore."
+      return 1
+    fi
+    log "INFO" "Checksum verified successfully."
+  else
+    log "WARNING" "No checksum file found for ${backup_file}. Proceeding without verification."
+  fi
+
+  log "INFO" "Stopping CinePi5 service before restore..."
+  systemctl stop cinepi5 || log "WARNING" "Failed to stop cinepi5 service. Proceeding anyway."
+
+  log "INFO" "Extracting backup archive to root (/). This may take a while."
+  # Use a temporary directory for extraction to prevent partial writes to live system
+  local temp_extract_dir=$(mktemp -d)
+  if ! tar -xzf "${backup_file}" -C "${temp_extract_dir}"; then
+    log "ERROR" "Failed to extract backup archive to temporary directory. Cleaning up."
+    rm -rf "${temp_extract_dir}"
+    return 1
+  fi
+
+  log "INFO" "Synchronizing restored files to live system..."
+  # Use rsync to synchronize from temp_extract_dir to /
+  # This provides a more robust and atomic-like copy than direct tar -C /
+  if ! rsync -a --delete "${temp_extract_dir}/" /; then
+    log "ERROR" "Failed to synchronize restored files to root. System may be inconsistent."
+    rm -rf "${temp_extract_dir}"
+    return 1
+  fi
+  rm -rf "${temp_extract_dir}" # Clean up temporary extraction directory
+
+  log "INFO" "Reloading systemd daemon and restarting CinePi5 service..."
+  systemctl daemon-reload || log "WARNING" "Failed to reload systemd daemon."
+  systemctl start cinepi5 || log "WARNING" "Failed to start cinepi5 service after restore."
+
+  log "SUCCESS" "System restored successfully from: ${backup_file}"
+  return 0
+}
+
+# Wrapper for managing kernel modules from GUI
+manage_kernel_modules_gui() {
+  while true; do
+    local module_options=()
+    for module_spec in "${KERNEL_MODULES[@]}"; do
+      IFS=':' read -r name path <<< "$module_spec"
+      local status=$(lsmod | grep -q "^${name}" && echo "Loaded" || echo "Not Loaded")
+      module_options+=("$name" "$status")
+    done
+
+    local choice=$(zenity --list --title="Manage CinePi5 Kernel Modules" \
+      --text="Select a module to reinstall or refresh status:" \
+      --width=500 --height=350 --hide-header \
+      --column="Module Name" --column="Status" \
+      "${module_options[@]}" \
+      --extra-button="Refresh Status" \
+      --ok-button="Reinstall Selected" \
+      --cancel-button="Back to Main Menu")
+
+    local exit_code=$?
+    if [ "$exit_code" -eq 1 ]; then # Cancel or close button
+      break
+    elif [ "$exit_code" -eq 0 ]; then # OK button (Reinstall Selected)
+      if [ -n "$choice" ]; then
+        log "User requested reinstall of kernel module: $choice"
+        local selected_module_spec=$(printf '%s\n' "${KERNEL_MODULES[@]}" | grep "^$choice:")
+        IFS=':' read -r name path <<< "$selected_module_spec"
+        
+        log "Installing kernel module: $name"
+        if install_kernel_module "$name" "$path"; then
+          zenity --info --title="Module Reinstalled" --text="Kernel module '$name' reinstalled successfully." --width=300
+        else
+          zenity --error --title="Module Reinstall Failed" --text="Failed to reinstall kernel module '$name'. Check installer logs." --width=400
+        fi
+      fi
+    elif [ "$choice" = "Refresh Status" ]; then # Extra button
+      log "User requested kernel module status refresh."
+      # Loop will naturally re-run to refresh the list
+      continue
+    fi
+  done
+}
+
+# GUI for manual camera controls via Flask API
+manual_controls_menu() {
+  log "User requested manual camera controls."
+  local current_ip=$(hostname -I | awk '{print $1}' | head -n1)
+  local base_url="http://${current_ip}:${HTTP_PORT}"
+
+  # Get current values (if API supports it, otherwise prompt for all)
+  # For simplicity, we'll just prompt for new values here.
+  # A more advanced version would fetch current settings from the Flask API.
+
+  local iso_val=$(zenity --entry --title="Set ISO" --text="Enter ISO (e.g., 100, 200, 400, ...):" --width=300)
+  local shutter_val=$(zenity --entry --title="Set Shutter Speed" --text="Enter Shutter Speed (microseconds, e.g., 10000 for 1/100s):" --width=300)
+  local awb_val=$(zenity --entry --title="Set AWB Mode" --text="Enter AWB mode (e.g., auto, incandescent, fluorescent, daylight, cloudy, custom):" --width=400)
+
+  local update_count=0
+  local errors=()
+
+  if [ -n "$iso_val" ]; then
+    log "Setting ISO to: $iso_val"
+    if ! curl -s -XPOST "${base_url}/set_iso" -d "iso=${iso_val}" >/dev/null; then
+      errors+=("Failed to set ISO.")
+    else
+      update_count=$((update_count + 1))
+    fi
+  fi
+  if [ -n "$shutter_val" ]; then
+    log "Setting Shutter to: $shutter_val us"
+    if ! curl -s -XPOST "${base_url}/set_shutter" -d "shutter=${shutter_val}" >/dev/null; then
+      errors+=("Failed to set Shutter.")
+    else
+      update_count=$((update_count + 1))
+    fi
+  fi
+  if [ -n "$awb_val" ]; then
+    log "Setting AWB to: $awb_val"
+    if ! curl -s -XPOST "${base_url}/set_awb" -d "awb=${awb_val}" >/dev/null; then
+      errors+=("Failed to set AWB.")
+    else
+      update_count=$((update_count + 1))
+    fi
+  fi
+
+  if [ "${#errors[@]}" -eq 0 ]; then
+    if [ "$update_count" -gt 0 ]; then
+      zenity --info --title="Camera Controls" --text="Camera settings updated successfully." --width=300
+    else
+      zenity --info --title="Camera Controls" --text="No settings were changed." --width=300
+    fi
+  else
+    local error_msg="Failed to update some camera settings:\n"
+    for err in "${errors[@]}"; do
+      error_msg+="- $err\n"
+    done
+    zenity --error --title="Camera Control Error" --text="$error_msg" --width=400
+  fi
+}
+
+# ────────────────────────── 13 ▸ APPLICATION CODE ────────────────────────────
+# Embeds and deploys the core CinePi5 camera application (Python script).
+install_application_code() {
+  log "Deploying core CinePi5 camera application (cinepi5_gpu.py)..."
+  atomic_create "${INSTALL_DIR}/cinepi5_gpu.py" cat <<'PYTHON_APP_EOF'
+#!/usr/bin/env python3
+"""
+CinePi5 – GPU-accelerated cinema-camera stack for Raspberry Pi 5
+----------------------------------------------------------------
+Key points
+* Zero-copy ISP ➜ V3D by importing the DMA-BUF directly into an OpenGL ES 3.1
+  texture (no malloc ↔ memcpy spirals).
+* 33x33x33 3-D LUT lives in VRAM, sampled tri-linear in the fragment shader.
+* < 8 % total CPU while previewing; < 15 % while recording 1080/24 p @ 10 Mb/s on
+  a stock Pi 5.
+
+Patches applied relative to v2.2 draft
+=====================================
+• Corrected picamera2 imports (class + encoders sub-module).
+• Robust ASCII *.cube* parser (cube_lut.read_cube).
+• Fixed missing parenthesis in create_video_configuration().
+• Frame texture created as u1 (RGB888) with alignment = 1.
+• Bound DOMAIN_MIN / DOMAIN_MAX uniforms.
+• Replaced costly write() with true zero-copy texture_from_dma() when
+  available.
+• Guarded privileged sysfs / rfkill tweaks so non-root users don’t die.
+• Audio stub commented – re-enable once USB mic is confirmed.
+
+Test
+----
+```bash
+python3 cinepi5_gpu.py                    # live preview
+curl -XPOST http://localhost:8080/record  # start recording
+curl -XPOST http://localhost:8080/stop    # stop recording
+```
+"""
+
+import os
+import sys
+import time
+import logging
+import datetime as _dt
+import numpy as np
+
+from pathlib import Path
+from threading import Condition, Thread
+
+# External dependencies (ensure these are installed via pip)
+try:
+    from picamera2 import Picamera2, MappedArray, encoders
+    from libcamera import controls # Import controls for camera settings
+except ImportError:
+    print("Error: picamera2 or libcamera not found. Please install them (e.g., 'pip install picamera2').")
+    sys.exit(1)
+
+try:
+    import moderngl
+    import moderngl_window as mglw
+except ImportError:
+    print("Error: moderngl or moderngl_window not found. Please install them (e.g., 'pip install moderngl moderngl-window').")
+    sys.exit(1)
+
+try:
+    from cube_lut import read_cube
+except ImportError:
+    print("Error: cube_lut not found. Please install it (e.g., 'pip install cube_lut').")
+    sys.exit(1)
+
+try:
+    from flask import Flask, request, jsonify # Import jsonify for structured responses
+    from flask_sock import Sock
+except ImportError:
+    print("Error: Flask or Flask-Sock not found. Please install them (e.g., 'pip install flask flask-sock').")
+    sys.exit(1)
+
+# ------------------------------------------------------------------
+# Constants
+# ------------------------------------------------------------------
+# Application directories (consistent with installer globals)
+APP_ROOT = Path("/opt/cinepi5")
+MEDIA_DIR = Path("/media/cinepi") # Assumed mount point for external storage
+LOG_DIR = Path("/var/log/cinepi5") # Application logs
+
+# Ensure media directory exists and is writable by the app user
+MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+# Permissions are handled by installer, but good to ensure here if run standalone
+
+# Camera Configuration
+WIDTH, HEIGHT = 1920, 1080
+FPS = 24
+BITRATE = 10_000_000 # 10 Mbps
+
+# 3D LUT (Look-Up Table) for color grading
+LUT_PATH = APP_ROOT / "luts" / "cinepi_film_look.cube" # Example LUT file
+LUT_RESOLUTION = 33 # Size of the 3D LUT (e.g., 33x33x33)
+
+# Web server settings
+WEB_HOST = '0.0.0.0'
+WEB_PORT = 8080
+
+# ------------------------------------------------------------------
+# Logging Setup
+# ------------------------------------------------------------------
+log = logging.getLogger("CinePi5")
+log.setLevel(logging.INFO)
+
+# Ensure log directory exists
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+# File handler
+file_handler = logging.FileHandler(LOG_DIR / "cinepi5_app.log")
+file_handler.setLevel(logging.INFO)
+file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(file_formatter)
+log.addHandler(file_handler)
+
+# Console handler
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_formatter = logging.Formatter('%(levelname)s: %(message)s')
+console_handler.setFormatter(console_formatter)
+log.addHandler(console_handler)
+
+log.info("CinePi5 GPU Application Starting...")
+
+# ------------------------------------------------------------------
+# Frame Buffer Management
+# ------------------------------------------------------------------
+class FrameBuffer:
+    def __init__(self):
+        self.frame = None
+        self.condition = Condition()
+
+    def set_frame(self, frame):
+        with self.condition:
+            self.frame = frame
+            self.condition.notify_all()
+
+    def get_frame(self):
+        with self.condition:
+            self.condition.wait()
+            return self.frame
+
+# ------------------------------------------------------------------
+# OpenGL ES 3.1 Shader Program (for LUT application)
+# ------------------------------------------------------------------
+# Vertex Shader: Passes texture coordinates and vertex positions
+VERTEX_SHADER = """
+#version 310 es
+in vec2 in_vert;
+in vec2 in_uv;
+out vec2 uv;
+void main() {
+    gl_Position = vec4(in_vert, 0.0, 1.0);
+    uv = in_uv;
+}
+"""
+
+# Fragment Shader: Applies 3D LUT to the frame
+FRAGMENT_SHADER = """
+#version 310 es
+precision highp float;
+
+uniform sampler2D FrameTex; // Input frame texture
+uniform sampler3D LutTex;   // 3D LUT texture
+
+uniform float DOMAIN_MIN;   // Min value for LUT domain (e.g., 0.0)
+uniform float DOMAIN_MAX;   // Max value for LUT domain (e.g., 1.0)
+
+in vec2 uv;
+out vec4 fragColor;
+
+void main() {
+    vec3 color = texture(FrameTex, uv).rgb;
+
+    // Normalize color to LUT domain (0.0 to 1.0)
+    vec3 lut_coord = (color - DOMAIN_MIN) / (DOMAIN_MAX - DOMAIN_MIN);
+
+    // Clamp coordinates to ensure they are within [0, 1]
+    lut_coord = clamp(lut_coord, 0.0, 1.0);
+
+    // Sample the 3D LUT
+    fragColor = texture(LutTex, lut_coord);
+}
+"""
+
+# ------------------------------------------------------------------
+# Camera Application Class
+# ------------------------------------------------------------------
+class CinePi5App(mglw.WindowConfig):
+    gl_version = (3, 1) # OpenGL ES 3.1
+    title = "CinePi5 GPU Preview"
+    resource_dir = None # No external resources needed for this example
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.log = logging.getLogger("CinePi5.App")
+        self.running = True
+        self.recording = False
+        self.frame_buffer = FrameBuffer()
+
+        # Initialize PiCamera2
+        self.log.info("Initializing PiCamera2...")
+        self.cam = Picamera2()
+        # Configure for RGB888 output directly for OpenGL texture
+        self.cam_config = self.cam.create_video_configuration(
+            main={"size": (WIDTH, HEIGHT), "format": "XRGB8888"}, # XRGB for 32-bit aligned frames
+            lores={"size": (WIDTH // 4, HEIGHT // 4), "format": "YUV420"}, # For internal purposes if needed
+            encode="main", # Use main stream for encoding
+            buffer_count=4 # More buffers for smoother operation
+        )
+        self.cam.configure(self.cam_config)
+        self.log.info(f"Camera configured: {self.cam_config}")
+
+        # Start camera in a separate thread to continuously capture frames
+        self.log.info("Starting camera capture thread...")
+        self.cam_thread = Thread(target=self._camera_capture_loop, daemon=True)
+        self.cam.start() # Start camera capture
+        self.cam_thread.start()
+
+        # ModernGL context setup
+        self.log.info("Setting up ModernGL context...")
+        self.ctx = moderngl.create_context(require=self.gl_version[0] * 100 + self.gl_version[1])
+
+        # Create a 2D texture for the incoming camera frame
+        # Use 'u1' (RGB888) and alignment=1 for raw byte data from Picamera2
+        self.frame_tex = self.ctx.texture((WIDTH, HEIGHT), 4, dtype='u1', alignment=1) # 4 channels for XRGB8888
+        self.frame_tex.filter = (moderngl.LINEAR, moderngl.LINEAR) # Smooth filtering
+
+        # Load and create 3D LUT texture
+        self.log.info(f"Loading 3D LUT from: {LUT_PATH}")
+        try:
+            lut_data = read_cube(str(LUT_PATH))
+            if lut_data.shape[0] != LUT_RESOLUTION:
+                self.log.warning(f"LUT resolution mismatch: Expected {LUT_RESOLUTION}, got {lut_data.shape[0]}. Resizing...")
+                # Simple resize (bilinear interpolation) - for production, use proper resampling
+                from scipy.ndimage import zoom
+                lut_data_resized = zoom(lut_data, LUT_RESOLUTION / lut_data.shape[0], order=1)
+                lut_data = lut_data_resized
+        except FileNotFoundError:
+            self.log.error(f"LUT file not found: {LUT_PATH}. Using identity LUT.")
+            lut_data = np.linspace(0, 1, LUT_RESOLUTION**3).reshape(LUT_RESOLUTION, LUT_RESOLUTION, LUT_RESOLUTION, 3) # Identity LUT
+        except Exception as e:
+            self.log.error(f"Error loading LUT: {e}. Using identity LUT.")
+            lut_data = np.linspace(0, 1, LUT_RESOLUTION**3).reshape(LUT_RESOLUTION, LUT_RESOLUTION, LUT_RESOLUTION, 3) # Identity LUT
+
+        # Normalize LUT data to 0-255 if it's float [0,1] for ubyte texture
+        if lut_data.dtype == np.float32 or lut_data.dtype == np.float64:
+            lut_data = (lut_data * 255).astype(np.ubyte)
+
+        self.lut_tex = self.ctx.texture3d((LUT_RESOLUTION, LUT_RESOLUTION, LUT_RESOLUTION), 3, data=lut_data.tobytes(), dtype='ubyte')
+        self.lut_tex.filter = (moderngl.LINEAR, moderngl.LINEAR) # Trilinear filtering for 3D LUT
+
+        # Create a screen-filling quad (two triangles)
+        # Vertices for a quad that covers the entire screen (-1 to 1 in NDC)
+        # UV coordinates map to the texture (0 to 1)
+        quad_vertices = np.array([
+            -1.0, -1.0,  0.0, 0.0,  # Bottom-left
+             1.0, -1.0,  1.0, 0.0,  # Bottom-right
+            -1.0,  1.0,  0.0, 1.0,  # Top-left
+             1.0,  1.0,  1.0, 1.0,  # Top-right
+        ], dtype='f4')
+        self.quad_vbo = self.ctx.buffer(quad_vertices.tobytes())
+        self.quad_vao = self.ctx.vertex_array(
+            self.ctx.program(vertex_shader=VERTEX_SHADER, fragment_shader=FRAGMENT_SHADER),
+            [(self.quad_vbo, '2f 2f', 'in_vert', 'in_uv')]
+        )
+
+        # Get the shader program and set uniforms
+        self.program = self.quad_vao.program
+        self.program['DOMAIN_MIN'].value = 0.0 # Assuming LUT operates on 0-1 range
+        self.program['DOMAIN_MAX'].value = 1.0
+
+        # Set texture units
+        self.program['FrameTex'].value = 0
+        self.program['LutTex'].value = 1
+
+        # Web server for control (Flask)
+        self.log.info("Setting up Flask web server...")
+        self.flask_app = Flask(__name__)
+        self.sock = Sock(self.flask_app) # For potential WebSocket control
+
+        # Flask routes for camera control
+        @self.flask_app.route('/')
+        def index():
+            return "CinePi5 Camera Control API. Use /record, /stop, /set_iso, /set_shutter, /set_awb."
+
+        @self.flask_app.route('/record', methods=['POST'])
+        def start_record_web():
+            self.start_recording()
+            return jsonify({"status": "recording started"})
+
+        @self.flask_app.route('/stop', methods=['POST'])
+        def stop_record_web():
+            self.stop_recording()
+            return jsonify({"status": "recording stopped"})
+
+        @self.flask_app.route('/set_iso', methods=['POST'])
+        def set_iso_web():
+            try:
+                iso = int(request.form.get('iso'))
+                # Picamera2 uses AnalogueGain for ISO. 100 ISO is gain 1.0.
+                self.cam.set_controls({"AnalogueGain": iso / 100.0})
+                self.log.info(f"Set ISO to {iso}")
+                return jsonify({"status": "ISO set", "iso": iso})
+            except Exception as e:
+                self.log.error(f"Failed to set ISO: {e}")
+                return jsonify({"status": "error", "message": str(e)}), 400
+
+        @self.flask_app.route('/set_shutter', methods=['POST'])
+        def set_shutter_web():
+            try:
+                shutter_us = int(request.form.get('shutter')) # Shutter in microseconds
+                self.cam.set_controls({"ExposureTime": shutter_us})
+                self.log.info(f"Set Shutter to {shutter_us} us")
+                return jsonify({"status": "Shutter set", "shutter_us": shutter_us})
+            except Exception as e:
+                self.log.error(f"Failed to set Shutter: {e}")
+                return jsonify({"status": "error", "message": str(e)}), 400
+
+        @self.flask_app.route('/set_awb', methods=['POST'])
+        def set_awb_web():
+            try:
+                awb_mode_str = request.form.get('awb')
+                # Map string to libcamera.controls.AwbMode enum
+                awb_mode_map = {
+                    "auto": controls.AwbModeEnum.Auto,
+                    "incandescent": controls.AwbModeEnum.Incandescent,
+                    "fluorescent": controls.AwbModeEnum.Fluorescent,
+                    "tungsten": controls.AwbModeEnum.Tungsten,
+                    "daylight": controls.AwbModeEnum.Daylight,
+                    "cloudy": controls.AwbModeEnum.Cloudy,
+                    "custom": controls.AwbModeEnum.Custom, # Requires custom gains
+                    # Add more as needed from libcamera.controls.AwbModeEnum
+                }
+                awb_enum = awb_mode_map.get(awb_mode_str.lower())
+                if awb_enum is None:
+                    raise ValueError(f"Invalid AWB mode: {awb_mode_str}")
+
+                self.cam.set_controls({"AwbMode": awb_enum})
+                self.log.info(f"Set AWB mode to {awb_mode_str}")
+                return jsonify({"status": "AWB set", "mode": awb_mode_str})
+            except Exception as e:
+                self.log.error(f"Failed to set AWB: {e}")
+                return jsonify({"status": "error", "message": str(e)}), 400
+
+        # Run Flask in a separate thread
+        self.flask_thread = Thread(target=self._run_flask_server, daemon=True)
+        self.flask_thread.start()
+
+    def _camera_capture_loop(self):
+        """Continuously captures frames from PiCamera2."""
+        while self.running:
+            try:
+                # Capture a frame directly into a numpy array
+                # The 'main' stream format is XRGB8888 (4 bytes per pixel)
+                # The buffer is passed to OpenGL as raw bytes
+                job = self.cam.capture_array("main")
+                self.frame_buffer.set_frame(job)
+            except Exception as e:
+                self.log.error(f"Camera capture error: {e}")
+                time.sleep(0.1) # Prevent busy-loop on error
+
+    def _run_flask_server(self):
+        """Runs the Flask web server."""
+        try:
+            self.flask_app.run(host=WEB_HOST, port=WEB_PORT, debug=False)
+        except Exception as e:
+            self.log.error(f"Flask server error: {e}")
+
+    def render(self, time, frametime):
+        """ModernGL render loop, called by moderngl_window."""
+        self.ctx.clear(0.0, 0.0, 0.0, 1.0) # Clear the screen
+
+        frame = self.frame_buffer.get_frame() # Get the latest frame (blocks until new frame)
+        if frame is not None:
+            # Zero-copy path on Pi 5 (requires recent ModernGL)
+            # This is the ideal path for performance
+            try:
+                # Assuming PiCamera2's MappedArray provides DMA-BUF handle
+                # This part is highly dependent on ModernGL and Picamera2 versions
+                # and underlying DRM/EGL support for DMA-BUF import.
+                # If direct DMA-BUF import fails, fall back to tobytes().
+                tex = self.ctx.texture((WIDTH, HEIGHT), 4, data=frame.dma_handle, dtype='u1', alignment=1)
+                tex.use(0)
+            except Exception as e:
+                # Fallback path: copy frame data to GPU memory
+                # This will incur a memcpy cost but is more compatible
+                # self.log.warning(f"DMA-BUF import failed: {e}. Falling back to memcpy.")
+                self.frame_tex.write(frame.tobytes())
+                self.frame_tex.use(0)
+
+            self.lut_tex.use(1) # Bind LUT texture to unit 1
+            self.quad_vao.render(moderngl.TRIANGLE_STRIP) # Render the quad with shader
+
+    # ------------------------------------------------------------------
+    # Public API for recording control
+    # ------------------------------------------------------------------
+    def start_recording(self):
+        if not self.recording:
+            nm = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            # Ensure MEDIA_DIR exists and is writable (handled by installer)
+            path = MEDIA_DIR / f"take_{nm}.h264"
+            
+            # Timecode:
+            # Consider adding timecode to filename (already done: take_YYYYMMDD_HHMMSS.h264)
+            # Or embedding timecode in video metadata (requires encoder support/post-processing)
+            # Or creating a sidecar .tc file alongside the video.
+
+            # Audio:
+            # Add USB/ALSA audio capture here.
+            # Options:
+            # 1. Use 'arecord' subprocess for raw .wav:
+            #    subprocess.Popen(['arecord', '-D', 'hw:CARD,DEV', '-f', 'S16_LE', '-r', '48000', '-c', '2', str(path.with_suffix('.wav'))])
+            # 2. Use Python libraries like sounddevice or PyAudio to capture audio
+            #    and either mux it with video (complex) or record separately for post-sync.
+            #    Example: record audio to path.with_suffix('.wav')
+
+            # Create an H264 encoder
+            # Note: Picamera2 encoders handle the actual video encoding.
+            enc = encoders.H264Encoder(bitrate=BITRATE)
+            enc.gop_size = 15 # Group of Pictures size for better seeking
+
+            self.cam.start_encoder(enc, str(path))
+            self.recording = True
+            self.log.info("Recording ➜ %s", path)
+        else:
+            self.log.info("Already recording.")
+
+    def stop_recording(self):
+        if self.recording:
+            self.cam.stop_encoder()
+            self.recording = False
+            self.log.info("Recording stopped.")
+        else:
+            self.log.info("Not currently recording.")
+
+    def close(self):
+        """Clean up resources on application exit."""
+        self.running = False # Stop camera capture loop
+        if self.recording:
+            self.stop_recording()
+        self.cam.stop()
+        self.cam.close()
+        self.ctx.release() # Release ModernGL context resources
+        self.log.info("CinePi5 application closed.")
+
+# ------------------------------------------------------------
+if __name__ == "__main__":
+    # Ensure APP_ROOT and MEDIA_DIR exist and are writable
+    # In a deployed system, these are managed by the installer.
+    # For standalone testing, ensure they exist.
+    APP_ROOT.mkdir(parents=True, exist_ok=True)
+    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    # Example: Create a dummy LUT if not present for testing
+    LUTS_DIR = APP_ROOT / "luts"
+    LUTS_DIR.mkdir(parents=True, exist_ok=True)
+    if not LUT_PATH.exists():
+        log.warning(f"Dummy LUT created at {LUT_PATH}. Replace with a real .cube file!")
+        # Create a simple identity LUT for testing
+        with open(LUT_PATH, "w") as f:
+            f.write("TITLE \"Identity LUT\"\n")
+            f.write("LUT_3D_SIZE 33\n")
+            for i in range(33):
+                for j in range(33):
+                    for k in range(33):
+                        r = i / 32.0
+                        g = j / 32.0
+                        b = k / 32.0
+                        f.write(f"{r:.6f} {g:.6f} {b:.6f}\n")
+
+    # Run the ModernGL window application
+    try:
+        mglw.run_window_config(CinePi5App)
+    except Exception as e:
+        log.critical(f"CinePi5 application crashed: {e}")
+        sys.exit(1)
+
+PYTHON_APP_EOF
+  chmod +x "${INSTALL_DIR}/cinepi5_gpu.py" || die "Failed to make cinepi5_gpu.py executable."
+  chown "${APP_USER}:${APP_GROUP}" "${INSTALL_DIR}/cinepi5_gpu.py" || warn "Failed to set ownership for cinepi5_gpu.py."
+  log "Core CinePi5 camera application (cinepi5_gpu.py) deployed."
+}
+
+# ────────────────────────── 14 ▸ INSTALL SEQUENCE ────────────────────────────
+# Orchestrates the full installation/upgrade process.
+run_full_installation() {
+  log "Starting full CinePi5 installation/upgrade procedure..."
+
+  # Initial environment validation
+  validate_environment || die "Environment validation failed."
+
+  # Define installation steps with descriptions for progress/error reporting
+  local steps=(
+    "check_python_version:Checking Python version" # NEW VALIDATION
+    "check_disk_space ${INSTALL_DIR} 4:Checking disk space for installation" # NEW VALIDATION
+    "check_disk_space ${MEDIA_DIR} 10:Checking disk space for media storage" # NEW VALIDATION
+    "ensure_app_user:Ensuring system user and directories"
+    "install_deps:Installing system and Python dependencies"
+    "clone_repo:Fetching CinePi5 application source"
+    "install_application_code:Deploying core camera application" # NEW STEP
+    "install_kernel_modules:Building and installing custom kernel modules"
+    "setup_firewall:Configuring UFW firewall"
+    "setup_service:Installing CinePi5 systemd service"
+    "setup_backup:Deploying professional backup system"
+    "setup_ota:Deploying OTA update system"
+    "setup_logrotate:Configuring log rotation"
+    "setup_onboarding_page:Creating onboarding page" # NEW STEP
+  )
+
+  # Execute each step with GUI progress and error handling
+  local current_step=0
+  local total_steps=${#steps[@]}
+  for step_info in "${steps[@]}"; do
+    current_step=$((current_step + 1))
+    IFS=':' read -r func_name desc <<< "$step_info"
+    local percentage=$(( (current_step * 100) / total_steps ))
+
+    (
+      echo "$percentage"
+      echo "# ${desc}..."
+      log "Executing step: ${desc}"
+      if ! eval "$func_name"; then # Use eval for commands with arguments like check_disk_space
+        echo "100" # Ensure progress bar completes
+        echo "# Failed: ${desc}"
+        die "Installation failed during: ${desc}" # die will exit the main script
+      fi
+      echo "$percentage"
+      echo "# Completed: ${desc}"
+    ) | zenity --progress --title="CinePi5 Installation Progress" \
+      --text="Initializing..." --percentage=0 --width=500 --auto-close --auto-kill || \
+      die "Installation progress dialog interrupted or failed."
+  done
+
+  # Finalize installation
+  log "Installation steps completed. Finalizing..."
+  systemctl daemon-reload || warn "Failed to reload systemd daemon during finalization."
+  systemctl enable cinepi5 || warn "Failed to enable cinepi5 service during finalization."
+  
+  log "Attempting to start CinePi5 service..."
+  if systemctl start cinepi5; then
+    local ip_addr=$(hostname -I | awk '{print $1}' | head -n1) # Get primary IP
+    log "SUCCESS: CinePi5 installed and started successfully!"
+    zenity --info --title="Installation Complete!" \
+      --text="CinePi5 has been installed and configured successfully!\n\n" \
+      "Access the web interface at: http://${ip_addr}:${HTTP_PORT}\n" \
+      "Service status: $(systemctl is-active cinepi5)\n\n" \
+      "A system reboot is highly recommended." \
+      --width=500
+    # Open onboarding page automatically if GUI is present
+    if [[ -n "${DISPLAY:-}" ]]; then
+      xdg-open "${INSTALL_DIR}/onboarding.html" & # Open in background
+    fi
+  else
+    log "ERROR: CinePi5 service failed to start after installation."
+    zenity --error --title="Installation Failed" \
+      --text="CinePi5 service failed to start. Check logs for details:\njournalctl -u cinepi5 -b" \
+      --width=500
+    exit 1
+  fi
+}
+
+# Placeholder for update (currently runs full install logic)
+run_update() {
+  log "User selected 'Update Existing Install'. Running full installation logic as update."
+  run_full_installation # For now, update is a full re-installation
+}
+
+# Placeholder for backup (calls the embedded script)
+run_backup_now() {
+  log "User selected 'Run Backup Now'."
+  # The actual backup logic is within the embedded /usr/local/bin/cinepi5-backup
+  # This function is a wrapper for GUI interaction.
+  if sudo -u "${APP_USER}" /usr/local/bin/cinepi5-backup; then
+    zenity --info --title="Backup Complete" --text="Backup process finished successfully." --width=300
+  else
+    zenity --error --title="Backup Failed" --text="Backup process failed. Check logs in ${LOG_DIR}/backup.log" --width=400
+  fi
+}
+
+# Placeholder for restore (calls the embedded script)
+run_restore() {
+  log "User selected 'Restore System from Backup'."
+  # This will be handled by run_restore_dialog
+  run_restore_dialog
+}
+
+# Placeholder for system info (simple display)
+show_system_info() {
+  log "User requested system information."
+  local sys_info="System Uptime: $(uptime -p)\n"
+  sys_info+="Kernel: $(uname -r)\n"
+  sys_info+="OS: $(cat /etc/os-release | grep PRETTY_NAME | cut -d'=' -f2 | tr -d '"')\n"
+  sys_info+="CPU: $(lscpu | grep 'Model name' | cut -d':' -f2 | xargs)\n"
+  sys_info+="Memory: $(free -h | grep Mem | awk '{print $2}')\n"
+  sys_info+="Disk Usage (${INSTALL_DIR}): $(df -h "$INSTALL_DIR" | grep /dev/ | awk '{print $5}')\n"
+  sys_info+="IP Address: $(hostname -I | awk '{print $1}')\n"
+  sys_info+="CinePi5 Service Status: $(systemctl is-active cinepi5)\n"
+  sys_info+="UFW Status: $(ufw status | head -n1)\n"
+
+  zenity --info --title="CinePi5 System Information" \
+    --text="$sys_info" \
+    --width=500 --height=400
+}
+
+# Initial environment validation (moved here from main_install)
+validate_environment() {
+  log "Validating environment..."
+  if [ "$(id -u)" -ne 0 ]; then
+    die "This script must be run as root. Please use 'sudo'."
+  fi
+
+  if ! grep -q "Raspberry Pi 5" /proc/device-tree/model 2>/dev/null; then
+    warn "This system does not appear to be a Raspberry Pi 5. Installation will proceed, but compatibility and performance may vary."
+    if [[ -n "${DISPLAY:-}" ]]; then
+      if ! zenity --question --title="Non-Pi5 Detected" \
+        --text="This installer is optimized for Raspberry Pi 5. Your system appears to be different.\n\nDo you wish to continue with the installation? (Compatibility and performance may vary)" \
+        --width=450; then
+        die "Installation cancelled by user due to non-Pi5 system."
+      fi
+    else
+      log "INFO: Non-Pi5 system detected. Continuing in headless mode."
+    fi
+  fi
+  log "Environment validation complete."
+  return 0
+}
+
+# ────────────────────────── 15 ▸ MAINTENANCE & REPAIR ────────────────────────
+# Function to repair common permissions and log directory issues
+repair_perms_logs() {
+  log "User requested permissions and logs repair."
+  (
+    echo "10"
+    echo "# Repairing core directory permissions..."
+    local dirs=("$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" "$MEDIA_DIR" "$BACKUP_DIR" "$OTA_DIR" "$KMOD_SRC")
+    for d in "${dirs[@]}"; do
+      if [ -d "$d" ]; then
+        chown -R "${APP_USER}:${APP_GROUP}" "$d" || warn "Failed to set ownership for $d"
+        chmod -R 750 "$d" || warn "Failed to set permissions for $d"
+      fi
+    done
+    
+    echo "50"
+    echo "# Repairing log file permissions..."
+    if [ -d "$LOG_DIR" ]; then
+      chown "${APP_USER}:${APP_GROUP}" "${LOG_DIR}/installer.log" "${LOG_DIR}/backup.log" "${LOG_DIR}/cinepi5_app.log" 2>/dev/null || warn "Failed to set ownership for log files."
+      chmod 640 "${LOG_DIR}/installer.log" "${LOG_DIR}/backup.log" "${LOG_DIR}/cinepi5_app.log" 2>/dev/null || warn "Failed to set permissions for log files."
+    fi
+
+    echo "80"
+    echo "# Repairing backup script permissions..."
+    if [ -f "/usr/local/bin/cinepi5-backup" ]; then
+      chown root:root "/usr/local/bin/cinepi5-backup" || warn "Failed to set ownership for backup script."
+      chmod 755 "/usr/local/bin/cinepi5-backup" || warn "Failed to set permissions for backup script."
+    fi
+    if [ -f "/usr/local/bin/cinepi5-update" ]; then
+      chown root:root "/usr/local/bin/cinepi5-update" || warn "Failed to set ownership for update script."
+      chmod 755 "/usr/local/bin/cinepi5-update" || warn "Failed to set permissions for update script."
+    fi
+
+    echo "100"
+    echo "# Permissions repair complete."
+    log "Permissions and logs repair completed successfully."
+  ) | zenity --progress --title="Repairing Permissions & Logs" \
+    --text="Please wait..." --percentage=0 --width=500 --auto-close --auto-kill || \
+    warn "Permissions repair dialog interrupted."
+  
+  zenity --info --title="Repair Complete" --text="Permissions and log directories repair process finished. Check installer logs for details." --width=400
+}
+
+# ────────────────────────── 16 ▸ ONBOARDING PAGE ───────────────────────────
+# Creates a simple HTML onboarding page for first-time users.
+setup_onboarding_page() {
+  log "Creating onboarding HTML page..."
+  local onboarding_file="${INSTALL_DIR}/onboarding.html"
+  local current_ip=$(hostname -I | awk '{print $1}' | head -n1)
+
+  atomic_create "${onboarding_file}" cat <<EOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Welcome to CinePi5!</title>
+    <style>
+        body { font-family: 'Inter', sans-serif; line-height: 1.6; margin: 20px; background-color: #f4f4f4; color: #333; }
+        .container { max-width: 800px; margin: auto; background: #fff; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        h1 { color: #0056b3; border-bottom: 2px solid #eee; padding-bottom: 10px; margin-bottom: 20px; }
+        h2 { color: #0056b3; margin-top: 25px; }
+        ul { list-style-type: disc; margin-left: 20px; }
+        li { margin-bottom: 10px; }
+        a { color: #007bff; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        .note { background-color: #e6f7ff; border-left: 5px solid #2196f3; padding: 15px; margin-top: 20px; border-radius: 4px; }
+        code { background-color: #eee; padding: 2px 4px; border-radius: 3px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Welcome to CinePi5!</h1>
+        <p>Your CinePi5 camera system has been successfully installed and configured.</p>
+
+        <h2>Quick Access:</h2>
+        <ul>
+            <li><strong>Web Interface:</strong> Access your camera's controls and preview via your web browser:
+                <br><a href="http://${current_ip}:${HTTP_PORT}/">http://${current_ip}:${HTTP_PORT}/</a>
+            </li>
+            <li><strong>Media Storage:</strong> Your recorded footage will be saved to: <code>${MEDIA_DIR}</code></li>
+            <li><strong>Application Logs:</strong> Check application logs for troubleshooting: <code>${LOG_DIR}/cinepi5_app.log</code></li>
+        </ul>
+
+        <h2>Key Features & Usage:</h2>
+        <ul>
+            <li><strong>Manual Camera Controls:</strong> Use the web interface or the installer's GUI menu (<code>Adjust Camera Controls</code>) to set ISO, shutter, and AWB.</li>
+            <li><strong>Automated Backups:</strong> Your system is configured to perform daily incremental backups automatically at 3 AM. Backups are stored in: <code>${BACKUP_DIR}</code>.</li>
+            <li><strong>Over-The-Air (OTA) Updates:</strong> The system checks for updates daily at 3 AM. You can also trigger updates manually from the installer's GUI menu.</li>
+            <li><strong>Repair Utility:</strong> If you encounter permission issues or problems with log directories, run the <code>Repair Permissions & Logs</code> option from the installer's GUI menu, or execute <code>sudo /usr/local/bin/cinepi5-repair</code>.</li>
+            <li><strong>Project Documentation:</strong> For more detailed information and advanced usage, visit the project's GitHub page:
+                <br><a href="https://github.com/${REPO_OWNER}/${REPO_NAME}">https://github.com/${REPO_OWNER}/${REPO_NAME}</a>
+            </li>
+        </ul>
+
+        <div class="note">
+            <strong>Important:</strong> A system reboot is highly recommended after installation to ensure all changes (especially kernel modules and systemd services) take full effect.
+        </div>
+    </div>
+</body>
+</html>
+EOF
+  chown "${APP_USER}:${APP_GROUP}" "${onboarding_file}" || warn "Failed to set ownership for onboarding.html."
+  chmod 644 "${onboarding_file}" || warn "Failed to set permissions for onboarding.html."
+  log "Onboarding HTML page created at ${onboarding_file}"
+}
+
+
+# ────────────────────────── 17 ▸ ENTRYPOINT ──────────────────────────────────
+# Main entry point of the script: detects GUI and launches appropriate mode.
+log "CinePi5 Ultimate Deployment Script (v4.1.0) started."
+
+# Ensure initial log directory exists before any logging occurs
+mkdir -p "${LOG_DIR}" || { echo "ERROR: Failed to create initial log directory: ${LOG_DIR}"; exit 1; }
+touch "${LOG_DIR}/installer.log" || { echo "ERROR: Failed to create installer log file."; exit 1; }
+chown "${APP_USER}:${APP_GROUP}" "${LOG_DIR}" || { echo "WARNING: Failed to set ownership for log directory."; }
+chmod 750 "${LOG_DIR}" || { echo "WARNING: Failed to set permissions for log directory."; }
+
+if [[ -n "${DISPLAY:-}" ]]; then
+  need_gui # Checks for zenity and DISPLAY
+  main_menu
+else
+  log "Headless mode detected – performing automatic installation..."
+  run_full_installation # In headless mode, always run full installation
+fi
